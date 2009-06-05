@@ -1,0 +1,66 @@
+subvert - Store system configuration files in a source-code control system
+and link them into place
+
+---
+Current version available from git://github.com/bryanstearns/subvert.git
+
+(I realize the irony here: currently, the only supported source code 
+control system is Subversion; I haven't needed to add Git support, but 
+will add it soon.)
+---
+
+/subvert is an svn checkout tree that mirrors the file system structure;
+files and directories are hardlinked/softlinked (respectively) to their 
+positions in the real filesystem.
+
+A configuration file, /subvert/subvert.conf, lists groups of files to
+be installed ("subverted") together. This subvert tool manages that file,
+performs installs using it, and can report on the status of subverted files.
+
+Example: we're managing Apache configuration, including the file
+/etc/httpd/conf/http.conf and an entire subdirectory /etc/httpd/sites.
+subvert.conf contains this:
+  [apache]
+  /etc/httpd/conf/httpd.conf
+  /etc/httpd/sites/
+
+"subvert --apply apache" would rename /etc/httpd/conf/httpd.conf to
+/etc/httpd/conf/httpd.conf.orig and hardlink our version in its place,
+then would softlink our /etc/httpd/sites into the /etc/httpd directory.
+
+"subvert --check" would report which subverted files have been changed
+and/or had their hard links broken.
+
+"subvert --add new_key /usr/local/bin/foo" would hardlink the existing
+file /usr/local/bin/foo into /subvert/local/bin/foo and add an entry
+to subvert.conf for it, within the [new_key] group (creating that
+group if necessary. It would also "svn add" the new file, but not
+commit it.
+
+"subvert --apply some_key" installs the files & directories associated
+with the [some_key] group.
+
+"subvert --help" explains more.
+
+
+Copyright (c) 2006-2009 Bryan Stearns
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+

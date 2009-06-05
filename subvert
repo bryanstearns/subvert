@@ -1,0 +1,652 @@
+#!/usr/bin/python
+#
+# subvert - Store system configuration files in a source-code control system
+# and link them into place
+# 
+# ---
+# Current version available from git://github.com/bryanstearns/subvert.git
+# 
+# (I realize the irony here: currently, the only supported source code 
+# control system is Subversion; I haven't needed to add Git support, but 
+# will add it soon.)
+# ---
+#
+# /subvert is an svn checkout tree that mirrors the file system structure;
+# files and directories are hardlinked/softlinked (respectively) to their 
+# positions in the real filesystem.
+#
+# A configuration file, /subvert/subvert.conf, lists groups of files to
+# be installed ("subverted") together. This subvert tool manages that file,
+# performs installs using it, and can report on the status of subverted files.
+# 
+# Example: we're managing Apache configuration, including the file
+# /etc/httpd/conf/http.conf and an entire subdirectory /etc/httpd/sites.
+# subvert.conf contains this:
+#   [apache]
+#   /etc/httpd/conf/httpd.conf
+#   /etc/httpd/sites/
+#
+# "subvert --apply apache" would rename /etc/httpd/conf/httpd.conf to
+# /etc/httpd/conf/httpd.conf.orig and hardlink our version in its place,
+# then would softlink our /etc/httpd/sites into the /etc/httpd directory.
+#
+# "subvert --check" would report which subverted files have been changed
+# and/or had their hard links broken.
+# 
+# "subvert --add new_key /usr/local/bin/foo" would hardlink the existing
+# file /usr/local/bin/foo into /subvert/local/bin/foo and add an entry
+# to subvert.conf for it, within the [new_key] group (creating that
+# group if necessary. It would also "svn add" the new file, but not
+# commit it.
+#
+# "subvert --apply some_key" installs the files & directories associated
+# with the [some_key] group.
+#
+# "subvert --help" explains more.
+#
+#--
+# Copyright (c) 2006-2009 Bryan Stearns
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#--
+
+import unittest
+
+# ---
+# This is a copy of my bjsutils.py, added here to make distribution easier.
+
+#!/usr/bin/python
+#
+# Misc python utilities
+#
+
+import sys, os, re, string, socket, datetime, time
+import popen2, fcntl, select
+from optparse import OptionParser
+
+class CommandError(RuntimeError): pass
+class ParameterError(RuntimeError): pass
+
+def runCommand(command, ignoreError=False, verbose=False):
+    """ Run a command; print its output (if verbose), and raise an exception if it fails (unless ignoreError) """
+    def makeNonBlocking(fd):
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NDELAY)
+        except AttributeError:
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.FNDELAY)
+    if hasattr(command, '__iter__'):
+        # support passing in a list of commands
+        for cmd in command:
+            runCommand(cmd, ignoreError, verbose)
+    else:
+        if verbose:
+            print "### %s " % command
+    
+        child = popen2.Popen3("(%s) 2>&1" % command)
+        child.tochild.close()
+        outfile = child.fromchild
+        outfd = outfile.fileno()
+        makeNonBlocking(outfd)
+        outData = []
+        outeof = 0
+        while 1:
+            ready = select.select([outfd], [], [])
+            if outfd in ready[0]:
+                outchunk = outfile.read()
+                if outchunk == '': outeof = 1
+                outData.append(outchunk)
+                if verbose:
+                    print outchunk
+            if outeof: break
+            select.select([], [], [], .1) # give a little time for buffers to fill
+        err = child.wait()
+        statusMsgs = []
+        if err and getattr(os, "WIFCONTINUED", None) is not None:
+            if os.WCOREDUMP(err):
+                statusMsgs.append('core dump')
+            if os.WIFCONTINUED(err):
+                statusMsgs.append('continued')
+            if os.WIFSTOPPED(err):
+                statusMsgs.append('stopped')
+            if os.WIFSIGNALED(err):
+                statusMsgs.append('signaled (%s, %s)' % (os.WSTOPSIG(err), os.WTERMSIG(err)))
+            if os.WIFEXITED(err):
+                exitStatus = os.WEXITSTATUS(err)
+                statusMsgs.append('exited with status %s' % exitStatus)
+                err = exitStatus
+        if err:
+            if not ignoreError:
+                raise CommandError, '%s failed w/ exit code %d (%s): %s' % (command, err, ",".join(statusMsgs), "".join(outData))
+        elif verbose:
+            print "### %s succeeded" % command
+            if len(statusMsgs) > 0:
+                print "    with status codes: %s" % ",".join(statusMsgs)
+
+        return "".join(outData)
+
+def makeDir(dir):
+    def makeOneDir(dir):
+        parent = os.path.split(dir)[0]
+        if len(parent) > 0 and not os.path.exists(parent):
+            makeOneDir(parent)
+        try: os.makedirs(dir)
+        except os.error: pass
+    dir = os.path.expanduser(dir)
+    makeOneDir(dir)
+
+def makeDirFor(path):
+    """ 
+    Make sure the directory hosting this file path exists.
+    Return the file path as-is, so this is suitable for use like this:
+    f = open(makeDirFor(somePath), 'w')...
+    """
+    makeDir(os.path.dirname(path))
+    return path
+
+
+# End of bjsutils.py
+# ---
+
+def indent(s, extra=0):
+    return '  ' * (s.count('/') + extra)
+
+def expand(path):
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
+def readFile(path):
+    f = open(path, 'r')
+    for s in f:
+        yield s.rstrip()
+    f.close()
+
+def firstLine(path):
+    f = open(path, 'r')
+    try:
+        return f.readline().rstrip()
+    finally:
+        f.close()
+
+# Add or remove the python version number from these strings
+pythonVersion = sys.version[:3]
+def removePythonVersion(s):
+    m = re.search(r"usr/lib/python(\d\.\d)/", s)
+    if m:
+        s = s[:m.start(1)] + s[m.end(1):]
+    return s
+def addPythonVersion(s):
+    i = s.find('usr/lib/python/')
+    if i != -1:
+        l = len('usr/lib/python')
+        s = s[:(i + l)] + pythonVersion + s[(i + l):]
+    return s
+
+def showDirState(dir, chroot=''):
+    ind = indent(dir)
+    realDir = "%s%s" % (chroot, dir)
+    items = os.listdir(realDir)
+    for f in items:
+        path = os.path.join(dir, f)
+        realPath = os.path.join(realDir, f)
+        # print "doing %s as though it were %s" % (realPath, path)
+        if os.path.isfile(realPath):
+            if f == "subvert.conf":
+                if True:
+                    print "%s(%s)" % (ind, f)
+                else:
+                    print "%s%s contains:" % (ind, f)
+                    for s in readFile(realPath):
+                        print "%s  %s" % (ind, s)
+            else:
+                print "%s%s: '%s'" % (ind, f, firstLine(realPath))
+        elif os.path.islink(realPath):
+            target = os.readlink(realPath)
+            if target[0] != os.pathsep:
+                target = os.path.join(os.path.dirname(realPath), target)
+            if target.startswith(chroot):
+                target = target[len(chroot):]
+            print "%s%s --> %s" % (ind, f, target)
+            showDirState("%s/" % path, chroot)
+        elif os.path.isdir(realPath):
+            print "%s%s: (dir)" % (ind, f)
+            showDirState("%s/" % path, chroot)
+        else:
+            print "%s%s: ???" % (ind, f)            
+
+class Subverter(object):
+    def __init__(self, options):
+        self.chroot = getattr(options, 'chroot', '/')
+        self.subvertRoot = os.path.join(self.chroot, "subvert")
+        self.onlyFeature = getattr(options, 'feature', None)
+        self.verbose = getattr(options, 'verbose', False)
+        self.fix = getattr(options, 'fix', False)
+        self.noBackup = getattr(options, 'noBackup', False)
+        self.useDiff = getattr(options, 'useDiff', False)
+        self.confFilePath = expand(os.path.join(self.chroot, 'subvert', 'subvert.conf'))        
+        self.stateFilePath = expand(os.path.join(self.chroot, 'subvert', '.#subverted'))        
+        if not os.path.exists(self.stateFilePath):
+            self.subverted = set()
+        else:
+            self.subverted = set([ s for s in readFile(self.stateFilePath) ])
+    
+    def walk(self, handler, *args, **kwds):
+        """
+        Call the handler for each entry in the subversion file
+        """
+        feature = None
+        count = 0
+        for s in readFile(self.confFilePath):
+            if len(s) == 0:
+                continue
+            c = s[0]
+            if c == '#':
+                continue
+            if c == '[':
+                foundFeatureName = s[1:s.index(']')]
+                if self.onlyFeature is None or foundFeatureName == self.onlyFeature:
+                    feature = foundFeatureName
+                else:
+                    feature = None
+                continue
+            if c == '/' and feature is not None:
+                if handler(s[1:], feature, *args, **kwds):
+                    count += 1
+        return count
+
+    def listFiles(self):
+        def listItem(filename, feature):
+            if feature != self.onlyFeature:
+                print "(skipping not in feature: %s)" % filename
+                return
+
+            isDir, sourcePath, targetPath, backupPath, targetParent = \
+                self.__generateRelatedPaths(filename)
+            print "%s" % sourcePath
+
+        self.walk(listItem)
+
+    def applyFiles(self):
+        def subvertItem(filename, feature):
+            """ Handle one item. """
+            if feature != self.onlyFeature:
+                print "(skipping not in feature: %s)" % filename
+                return
+
+            isDir, sourcePath, targetPath, backupPath, targetParent = \
+                self.__generateRelatedPaths(filename)
+
+            if os.path.exists(targetPath):
+                if isDir:
+                    if not os.path.isdir(targetPath):
+                        raise Exception, "Expected a directory, found a file: %s" % targetPath
+                else:
+                    if not os.path.isfile(targetPath):
+                        raise Exception, "Expected a file, found a directory: %s" % targetPath
+                        
+                if not self.noBackup:
+                    if os.path.exists(backupPath):
+                        print "removing existing %s (backup exists already)" % targetPath
+                        os.unlink(targetPath)
+                    else:
+                        print "renaming %s to %s" % (targetPath, backupPath)
+                        os.rename(targetPath, backupPath)
+                else:
+                    print "removing existing %s (--nobackup)" % targetPath
+                    os.unlink(targetPath)
+
+            elif not os.path.exists(targetParent):
+                print "creating target parent %s" % targetParent
+                os.makedirs(targetParent)
+                
+            if isDir:
+                print "softlinking %s as %s" % (sourcePath, targetPath)
+                os.symlink(sourcePath, targetPath)
+            else:
+                print "hardlinking %s as %s" % (sourcePath, targetPath)
+                os.link(sourcePath, targetPath)
+
+        self.walk(subvertItem)
+        self.markSubverted(self.onlyFeature)
+    
+    def markSubverted(self, feature):
+        runCommand("echo %s >>%s" % (feature, self.stateFilePath))
+        self.subverted.add(feature)
+
+    def __generateRelatedPaths(self, filename, existing=False):
+        if existing:
+            isDir = os.path.isdir(filename)
+        else:
+            isDir = filename.endswith('/')
+            if isDir: filename = filename[:-1] # drop trailing slash
+        
+        sourcePath = removePythonVersion(os.path.join(self.chroot, "subvert", filename))
+        targetPath = addPythonVersion(os.path.join(self.chroot, filename))
+
+        backupPath = "%s.original" % targetPath
+        targetParent = os.path.split(targetPath)[0]
+        if existing and isDir: filename = "%s/" % filename
+        if self.verbose:
+            print "%s --> %s, %s, %s, %s, %s" % (filename, isDir and "dir" or "file", sourcePath, targetPath, backupPath, targetParent)
+        return (isDir, sourcePath, targetPath, backupPath, targetParent)
+
+
+    def checkFiles(self):
+        def checkItem(filename, feature):
+            """ Check one item. """
+            if not feature in self.subverted:
+                # print "(skipping not subverted [%s]: %s)" % (feature, filename)
+                return False
+
+            try:
+                isDir, sourcePath, targetPath, backupPath, targetParent = \
+                    self.__generateRelatedPaths(filename)
+
+                if not os.path.exists(sourcePath):
+                    raise Exception, "Source not present:\n   %s" % sourcePath
+                if not os.path.exists(targetPath):
+                    if self.fix:
+                        runCommand("ln %s %s" % (sourcePath, targetPath))
+                        print "Target not present; NOT fixed:\n   # ln %s %s"\
+                            % (sourcePath, targetPath)
+                        return False
+                    else:
+                        raise Exception, "Target not present:\n   # ln %s %s"\
+                            % (sourcePath, targetPath)
+                if isDir:
+                    # It's a directory - we just expect it to exist in the target.
+                    if not os.path.isdir(targetPath):
+                        raise Exception, "Expected a directory, found a file:\n   %s" % targetPath
+                else: 
+                    # Not a directory
+                    if os.path.isdir(targetPath):
+                        raise Exception, "Expected a file, found a directory:\n   %s" % targetPath
+
+                    sourceInode = os.stat(sourcePath).st_ino
+                    targetInode = os.stat(targetPath).st_ino
+                    if sourceInode != targetInode:
+                        # Are the the same?
+                        meldCmd  = "%s %s %s" % (
+                            "diff" if self.useDiff else "meld",
+                            sourcePath, targetPath)
+                        diffCmd = "diff %s %s" % (sourcePath, targetPath)
+                        lnCmd = "sudo ln -f %s %s" % (sourcePath, targetPath)
+                        try:
+                            runCommand(diffCmd)
+                        except CommandError:
+                            raise Exception, "Target file is not a hard link, and differs%s:\n   # %s\n   %s" \
+                                  % (self.fix and "; not fixed" or "", meldCmd, lnCmd)
+                        else:
+                            if self.fix:
+                                runCommand("rm %s; ln %s %s" \
+                                           % (targetPath, sourcePath, targetPath))
+                                print "Target file matched, but wasn't a link; fixed:\n   %s" \
+                                      % targetPath
+                            else:
+                                raise Exception, "Target file is not a hard link, but matches:\n   %s" % lnCmd
+                        
+                return False
+            except:
+                print "### %s" % sys.exc_info()[1]
+                return True
+        if self.walk(checkItem):
+            sys.exit(1)
+
+    def addNewFiles(self, args):
+        # Build an array of tuples: each entry contains
+        # - a feature name
+        # - a list of any non-filename lines
+        # - a list of filenames
+        features = [ ('', [], [],) ]
+        selectedFeature = None
+        for s in readFile(self.confFilePath):
+            if len(s) == 0 or s[0] == '#':
+                features[-1][1].append(s)
+                continue
+            if s[0] == '[':
+                foundFeatureName = s[1:s.index(']')]
+                newFeatureTuple = (foundFeatureName, [], [],)
+                if foundFeatureName == self.onlyFeature:
+                    selectedFeature = newFeatureTuple
+                features.append(newFeatureTuple)
+                continue
+
+            features[-1][2].append(s)
+
+        # Create this feature if it doesn't already exist.
+        if selectedFeature is None:
+            selectedFeature = (self.onlyFeature, [''], [])
+            features.append(selectedFeature)
+            self.markSubverted(self.onlyFeature)
+
+        # Add the new files
+        for filename in args:
+            isDir, sourcePath, targetPath, backupPath, targetParent = \
+                self.__generateRelatedPaths(expand(filename)[1:], True)
+            if isDir:
+                raise Exception, "Sorry, can't subvert directories yet"
+
+            if os.path.exists(sourcePath):
+                # It already exists in the /subvert tree?!
+                raise Exception, "'%s' already exists" % sourcePath
+
+            # Make a backup
+            if not os.path.exists(backupPath):
+                os.system("cp -p '%s' '%s'" % (targetPath, backupPath))
+
+            # Add this file to the list
+            selectedFeature[2].append(targetPath)
+            
+            # Add any newly-required directories to the subvert tree
+            p = ""
+            for subdir in sourcePath.split("/")[:-1]:
+                p = "%s/%s" % (p, subdir)
+                if not os.path.isdir(p):
+                    os.system("svn mkdir '%s'" % p)
+
+            # Link the file into the subvert tree
+            # print "hardlinking %s as %s" % (targetPath, sourcePath)
+            os.link(targetPath, sourcePath)
+
+            # Add the file to svn
+            os.system("svn add '%s'" % sourcePath)
+
+        # Resort the files in the selected feature
+        selectedFeature[2].sort()
+        features.sort()
+
+        # Rewrite the file
+        tmpPath = "%s.tmp" % self.confFilePath
+        os.rename(self.confFilePath, tmpPath)
+        f = file(self.confFilePath, 'w')
+        try:
+            for featureName, comments, fileList in features:
+                if len(featureName) > 0:
+                    f.write("[%s]\n" % featureName)
+                if len(fileList) > 0:
+                    f.write("%s\n" % "\n".join(fileList))
+                if len(comments) > 0:
+                    f.write("%s\n" % "\n".join(comments))
+            f.close()
+            f = None
+            os.unlink(tmpPath)
+        except:
+            if f is not None:
+                f.close()
+            try:
+                os.unlink(self.confFilePath)
+            except:
+                pass
+            try:
+                os.rename(tmpPath, self.confFilePath, tmpPath)
+            except:
+                pass
+            raise
+
+setupDone = False
+class SubvertTest(unittest.TestCase):
+    # make the test environment
+    root = "/tmp/subverttest"
+
+    def _writeFile(self, path, content):
+        path = "%s%s" % (SubvertTest.root, path)
+        parentDir = os.path.split(path)[0]
+        if not os.path.isdir(parentDir):
+            os.makedirs(parentDir)
+        f = open(path, 'w')
+        try:
+            f.write("%s\n" % content)
+        finally:
+            f.close()
+            
+    def _fileContains(self, path, content):
+        path = "%s%s" % (SubvertTest.root, path)
+        s = firstLine(path)
+        return s == content
+
+    def setUp(self):
+        # Run us once.
+        global setupDone
+        if setupDone:
+            return
+        setupDone = True
+        
+        os.system("rm -rf %s" % SubvertTest.root)
+        
+        # Make the original tree
+        self._writeFile("/etc/etcFile1", "Original version of etcFile1")
+        self._writeFile("/etc/etcFile2", "Original version of etcFile2")
+        self._writeFile("/etc/etcFile3", "Original version of etcFile3")
+        self._writeFile("/etc/subdir1/subdir1File1", "Original version of subdir1File1")
+        self._writeFile("/etc/subdir2/subdir2File1", "Original version of subdir2File1")
+    
+        # Make the subvert tree
+        self._writeFile("/subvert/subvert.conf", """
+[feature1]
+/etc/etcFile1
+/etc/subdir1/
+/etc/subdir3/subdir3File1
+
+[feature2]
+/etc/subdir3/subdir3File2
+""")
+        self._writeFile("/subvert/etc/etcFile1", "New version of etcFile1")
+        self._writeFile("/subvert/etc/subdir1/subdir1File1", "New version of subdir1File1")
+        self._writeFile("/subvert/etc/subdir1/subdir1File2", "New version of subdir1File2")
+        self._writeFile("/subvert/etc/subdir3/subdir3File1", "New version of subdir3File1")
+        self._writeFile("/subvert/etc/subdir3/subdir3File2", "New version of subdir3File2")
+
+        # Run subvert on it
+        print "--- Before ---"
+        showDirState("/", SubvertTest.root)
+
+        main(["--verbose", "--chroot", SubvertTest.root, "--feature", "feature1"])
+
+        print "--- After feature1 ---"
+        showDirState("/", SubvertTest.root)
+
+        main(["--verbose", "--chroot", SubvertTest.root, "--feature", "feature2"])
+
+        print "--- After feature2 ---"
+        showDirState("/", SubvertTest.root)
+    
+    def testFileReplacement(self):
+        backup = "%s/etc/etcFile1.original" % SubvertTest.root
+        assert os.path.isfile(backup), 'file backup failed: %s' % backup
+        assert self._fileContains("/etc/etcFile1", "New version of etcFile1"), \
+               'wrong file content: %s -> "%s"' % ('/etc/etcFile1', firstLine("%s/etc/etcFile1" % SubvertTest.root))
+
+    def testDirectoryLinking(self):
+        backup = "%s/etc/subdir1.original" % SubvertTest.root
+        assert os.path.isdir(backup), 'directory backup failed: %s' % backup
+        link = "%s/etc/subdir1" % SubvertTest.root
+        assert os.path.islink(link), 'directory linking failed: %s' % link
+
+def main(args):
+    parser = OptionParser()
+    parser.add_option("-v", "--verbose", action="count", dest="verbose", 
+        help="Increase verbosity")
+    parser.add_option("--chroot", action="store", dest="chroot",
+                      default='/', metavar="CHROOT",
+                      help="Alternate root for testing")
+    parser.add_option("-f", "--feature", action="store", dest="feature",
+                      default=None, metavar="FEATURE",
+                      help="Limit processing to this feature name")
+    parser.add_option("--nobackup", action="store_true", dest="noBackup", default=False, 
+        help="Don't make backups of existing files.")
+    parser.add_option("--apply", action="store_true", dest="apply", default=False, 
+        help="Apply subverted files.")
+    parser.add_option("--check", action="store_true", dest="check", default=False, 
+        help="Check file linkage for orphaned subverted files; fix unchanged ones.")
+    parser.add_option("--fix", action="store_true", dest="fix", default=False, 
+        help="Fix file linkage for changed orphaned subverted files.")
+    parser.add_option("--list", action="store_true", dest="listonly", default=False, 
+        help="List files subverted by this feature.")
+    parser.add_option("--diff", action="store_true", dest="useDiff", default=False, 
+        help="use 'diff' instead of 'meld' when checking.")
+    parser.add_option("--test", action="store_true", dest="test", default=False, 
+        help="Run unit tests.")
+    parser.add_option("--debug", action="store_true", dest="debug", default=False, 
+        help="Set to cause a debug breakpoint after arg parsing.")
+    (options, args) = parser.parse_args(args)
+
+    if options.debug:
+        import pdb
+        pdb.set_trace()
+    
+    if options.test:
+        unittest.TextTestRunner().run(unittest.makeSuite(SubvertTest,'test'))
+        return
+
+    if False: # options.check:
+        for f in runCommand("find /subvert -type f -links 1 -print").split('\n'):
+            if len(f) == 0 or '.svn' in f or 'subvert.conf' in f:
+                continue
+            target = f[len('/subvert'):]
+            if not os.path.exists(target):
+                print "%s (target doesn't exist; not fixing)" % f
+            else:
+                try:
+                    runCommand("diff %s %s" % (f, target), verbose=options.verbose)
+                except CommandError:
+                    if options.fix:
+                        print "%s (changed; fixing)" % f
+                        runCommand("rm %s; ln %s %s" % (f, target, f))
+                    else:
+                        print "%s (changed; not fixing)" % f
+                else:
+                    print "%s (same; fixing)" % f
+                    runCommand("rm %s; ln %s %s" % (f, target, f))
+        return
+
+    subverter = Subverter(options)
+    if options.check or options.fix:
+        subverter.checkFiles()
+    else:
+        if options.feature is None:
+            raise Exception, "--feature option is required!"
+        if options.listonly:
+            subverter.listFiles()
+        elif options.apply:
+            subverter.applyFiles()
+        else:
+            subverter.addNewFiles(args)
+    
+if __name__ == "__main__":
+    main(sys.argv[1:])
