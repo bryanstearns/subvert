@@ -382,9 +382,10 @@ class Subverter(object):
                     targetInode = os.stat(targetPath).st_ino
                     if sourceInode != targetInode:
                         # Are the the same?
-                        meldCmd  = "%s %s %s" % (
-                            "diff" if self.useDiff else "meld",
-                            sourcePath, targetPath)
+                        if self.useDiff:
+                            meldCmd  = "diff %s %s" % (sourcePath, targetPath)
+                        else:
+                            meldCmd  = "meld %s %s" % (sourcePath, targetPath)
                         diffCmd = "diff %s %s" % (sourcePath, targetPath)
                         lnCmd = "sudo ln -f %s %s" % (sourcePath, targetPath)
                         try:
